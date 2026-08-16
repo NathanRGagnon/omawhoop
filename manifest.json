@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.nathanrgagnon.omawhoop",
+  "name": "Omawhoop",
+  "version": "1.0.0",
+  "author": "Nathan Gagnon",
+  "license": "MIT",
+  "description": "Live WHOOP recovery, strain, and sleep stats in your Omarchy bar",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Omawhoop",
+    "description": "Live WHOOP recovery, strain, and sleep stats in your Omarchy bar",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}
