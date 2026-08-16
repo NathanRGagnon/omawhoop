@@ -1,0 +1,103 @@
+#!/bin/bash
+
+# omarchy:summary=Print the latest WHOOP strain/recovery/sleep as JSON
+# omarchy:args=[--force]
+
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+
+#######################################
+# Shapes the combined status object from raw cycle/recovery/sleep responses.
+# Arguments:
+#   Cycle JSON, recovery JSON, sleep JSON — "null" for any that's unavailable.
+# Outputs:
+#   The status object on stdout.
+#######################################
+whoop_build_status() {
+  local cycle="$1" recovery="$2" sleep_json="$3"
+  jq -n \
+    --argjson cycle "$cycle" \
+    --argjson recovery "$recovery" \
+    --argjson sleep "$sleep_json" \
+    --argjson now "$(date +%s)" \
+    '
+    ($cycle.records[0] // null) as $c |
+    ($recovery.records[0] // null) as $r |
+    ($sleep.records[0] // null) as $s |
+    {
+      fetched_at: $now,
+      stale: false,
+      strain: ($c.score.strain // null),
+      strain_state: ($c.score_state // "UNKNOWN"),
+      kilojoule: ($c.score.kilojoule // null),
+      avg_hr: ($c.score.average_heart_rate // null),
+      max_hr: ($c.score.max_heart_rate // null),
+      cycle_start: ($c.start // null),
+      recovery: ($r.score.recovery_score // null),
+      recovery_state: ($r.score_state // "UNKNOWN"),
+      hrv_ms: ($r.score.hrv_rmssd_milli // null),
+      rhr: ($r.score.resting_heart_rate // null),
+      spo2: ($r.score.spo2_percentage // null),
+      skin_temp_c: ($r.score.skin_temp_celsius // null),
+      sleep_pct: ($s.score.sleep_performance_percentage // null),
+      sleep_state: ($s.score_state // "UNKNOWN"),
+      sleep_efficiency: ($s.score.sleep_efficiency_percentage // null),
+      respiratory_rate: ($s.score.respiratory_rate // null),
+      sleep_total_ms: (
+        if $s.score.stage_summary then
+          ($s.score.stage_summary.total_light_sleep_time_milli // 0)
+          + ($s.score.stage_summary.total_slow_wave_sleep_time_milli // 0)
+          + ($s.score.stage_summary.total_rem_sleep_time_milli // 0)
+        else null end
+      )
+    }
+    '
+}
+
+main() {
+  local force=false
+  [[ "${1:-}" == "--force" ]] && force=true
+
+  mkdir -p "$OMAWHOOP_CACHE_DIR"
+  chmod 700 "$OMAWHOOP_CACHE_DIR"
+
+  if [[ "$force" == false && -f "$OMAWHOOP_CACHE_FILE" ]]; then
+    local fetched_at now
+    fetched_at=$(jq -r '.fetched_at // 0' "$OMAWHOOP_CACHE_FILE")
+    now=$(date +%s)
+
+    if (( now - fetched_at < 300 )); then
+      cat "$OMAWHOOP_CACHE_FILE"
+      return 0
+    fi
+  fi
+
+  local token
+  token=$(whoop_ensure_token) || { echo '{"error":"not_authenticated"}'; exit 1; }
+
+  local cycle recovery sleep_json
+  whoop_api_get "$token" "/v2/cycle?limit=1"
+  cycle="$body"; [[ "$status" == 2* ]] || cycle="null"
+  whoop_api_get "$token" "/v2/recovery?limit=1"
+  recovery="$body"; [[ "$status" == 2* ]] || recovery="null"
+  whoop_api_get "$token" "/v2/activity/sleep?limit=1"
+  sleep_json="$body"; [[ "$status" == 2* ]] || sleep_json="null"
+
+  if [[ "$cycle" == "null" && "$recovery" == "null" && "$sleep_json" == "null" ]]; then
+    if [[ -f "$OMAWHOOP_CACHE_FILE" ]]; then
+      jq '.stale = true' "$OMAWHOOP_CACHE_FILE"
+      return 0
+    fi
+    echo '{"error":"fetch_failed"}'
+    exit 1
+  fi
+
+  local result
+  result=$(whoop_build_status "$cycle" "$recovery" "$sleep_json")
+
+  echo "$result" > "$OMAWHOOP_CACHE_FILE"
+  chmod 600 "$OMAWHOOP_CACHE_FILE"
+  echo "$result"
+}
+
+main "$@"

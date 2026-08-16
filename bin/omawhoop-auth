@@ -1,0 +1,178 @@
+#!/bin/bash
+
+# omarchy:summary=Connect, reconnect, or disconnect this device's WHOOP account
+# omarchy:args=<setup|save-config|login|logout|uninstall>
+
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+
+readonly UTILS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../utils" && pwd)"
+
+#######################################
+# Waits for WHOOP's OAuth redirect and prints the result as JSON.
+# Arguments:
+#   Expected CSRF state value.
+# Outputs:
+#   {"code": ..., "state": ..., "error": ...} on stdout.
+#######################################
+whoop_listen_for_callback() {
+  local expected_state="$1"
+  python3 "$UTILS_DIR/whoop_oauth.py" listen "$OMAWHOOP_REDIRECT_PORT" "$expected_state"
+}
+
+#######################################
+# Writes the client ID/secret to disk, 0600.
+# Globals:
+#   OMAWHOOP_CONFIG_DIR, OMAWHOOP_CONFIG_FILE
+# Arguments:
+#   Client ID, client secret.
+#######################################
+whoop_write_config() {
+  local client_id="$1" client_secret="$2"
+  mkdir -p "$OMAWHOOP_CONFIG_DIR"
+  chmod 700 "$OMAWHOOP_CONFIG_DIR"
+  # %q so a secret containing $, `, ", etc. round-trips safely through the
+  # later `source` in whoop_load_config instead of being re-expanded.
+  {
+    printf 'CLIENT_ID=%q\n' "$client_id"
+    printf 'CLIENT_SECRET=%q\n' "$client_secret"
+  } > "$OMAWHOOP_CONFIG_FILE"
+  chmod 600 "$OMAWHOOP_CONFIG_FILE"
+}
+
+# Interactive first-time setup: prompts for the WHOOP app's credentials,
+# then walks straight into login.
+whoop_setup() {
+  echo "WHOOP developer app (from developer.whoop.com):"
+  read -rp "  Client ID: " client_id
+  read -rsp "  Client Secret: " client_secret
+  echo
+
+  whoop_write_config "$client_id" "$client_secret"
+
+  echo
+  echo "Redirect URI for this app must be registered as: $OMAWHOOP_REDIRECT_URI"
+  read -rp "Press Enter once that's saved in the WHOOP developer dashboard..." _
+
+  whoop_login
+}
+
+whoop_save_config_stdin() {
+  local client_id client_secret
+  IFS= read -r client_id
+  IFS= read -r client_secret
+
+  if [[ -z "$client_id" || -z "$client_secret" ]]; then
+    echo "Missing client ID or secret." >&2
+    exit 1
+  fi
+
+  whoop_write_config "$client_id" "$client_secret"
+  echo "Saved."
+}
+
+whoop_login() {
+  whoop_load_config || { echo "Run 'omawhoop-auth setup' first." >&2; exit 1; }
+
+  local state
+  state=$(python3 "$UTILS_DIR/whoop_oauth.py" state)
+  local scope_enc redirect_enc client_id_enc
+  scope_enc=$(jq -rn --arg s "$WHOOP_SCOPES" '$s|@uri')
+  redirect_enc=$(jq -rn --arg u "$OMAWHOOP_REDIRECT_URI" '$u|@uri')
+  client_id_enc=$(jq -rn --arg c "$CLIENT_ID" '$c|@uri')
+
+  local auth_url="${WHOOP_AUTH_URL}?response_type=code"
+  auth_url+="&client_id=${client_id_enc}"
+  auth_url+="&redirect_uri=${redirect_enc}"
+  auth_url+="&scope=${scope_enc}"
+  auth_url+="&state=${state}"
+
+  echo "Opening browser for WHOOP authorization..."
+  xdg-open "$auth_url" >/dev/null 2>&1 &
+
+  local result_json code got_state err
+  result_json=$(whoop_listen_for_callback "$state")
+  code=$(jq -r '.code // empty' <<< "$result_json")
+  got_state=$(jq -r '.state // empty' <<< "$result_json")
+  err=$(jq -r '.error // empty' <<< "$result_json")
+
+  if [[ -z "$code" ]]; then
+    echo "Authorization failed or timed out${err:+: $err}" >&2
+    exit 1
+  fi
+  if [[ "$got_state" != "$state" ]]; then
+    echo "State mismatch on callback — aborting." >&2
+    exit 1
+  fi
+
+  local resp_raw http_status resp access refresh expires_in
+  resp_raw=$(curl -sS -w '\n%{http_code}' -X POST "$WHOOP_TOKEN_URL" \
+    --data-urlencode "grant_type=authorization_code" \
+    --data-urlencode "code=$code" \
+    --data-urlencode "redirect_uri=$OMAWHOOP_REDIRECT_URI" \
+    --data-urlencode "client_id=$CLIENT_ID" \
+    --data-urlencode "client_secret=$CLIENT_SECRET")
+  http_status="${resp_raw##*$'\n'}"
+  resp="${resp_raw%$'\n'*}"
+
+  if [[ "$http_status" != 2* ]]; then
+    echo "Token exchange failed (HTTP $http_status): $resp" >&2
+    exit 1
+  fi
+
+  access=$(jq -r '.access_token // empty' <<< "$resp")
+  refresh=$(jq -r '.refresh_token // empty' <<< "$resp")
+  expires_in=$(jq -r '.expires_in // 3600' <<< "$resp")
+
+  if [[ -z "$access" ]]; then
+    echo "Token exchange response missing access_token (HTTP $http_status): $resp" >&2
+    exit 1
+  fi
+  if [[ -z "$refresh" ]]; then
+    echo "Got an access token but no refresh_token — the WHOOP app may not have 'offline_access' enabled. Response: $resp" >&2
+    exit 1
+  fi
+
+  whoop_save_tokens "$access" "$refresh" "$expires_in"
+  rm -f "$OMAWHOOP_CACHE_FILE"
+  echo "WHOOP connected."
+}
+
+whoop_revoke_remote_token() {
+  whoop_load_config && [[ -f "$OMAWHOOP_TOKENS_FILE" ]] || return 0
+
+  local token
+  token=$(whoop_ensure_token || true)
+  [[ -n "$token" ]] || return 0
+
+  curl -fsS -X DELETE "$WHOOP_API_BASE/v2/user/access" \
+    -H "Authorization: Bearer $token" >/dev/null 2>&1 || true
+}
+
+whoop_logout() {
+  whoop_revoke_remote_token
+  rm -f "$OMAWHOOP_TOKENS_FILE" "$OMAWHOOP_CACHE_FILE"
+  echo "WHOOP disconnected."
+}
+
+whoop_uninstall() {
+  whoop_revoke_remote_token
+  rm -rf "$OMAWHOOP_CONFIG_DIR" "$OMAWHOOP_STATE_DIR" "$OMAWHOOP_CACHE_DIR"
+  echo "WHOOP disconnected and all omawhoop data removed."
+}
+
+main() {
+  case "${1:-}" in
+    setup) whoop_setup ;;
+    save-config) whoop_save_config_stdin ;;
+    login) whoop_login ;;
+    logout | revoke) whoop_logout ;;
+    uninstall) whoop_uninstall ;;
+    *)
+      echo "Usage: omawhoop-auth {setup|save-config|login|logout|uninstall}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

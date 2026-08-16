@@ -1,0 +1,115 @@
+#!/bin/bash
+
+# omarchy:summary=Print the last N days of WHOOP strain/recovery history as JSON (oldest first)
+# omarchy:args=[--days N] [--force]
+
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+
+#######################################
+# Builds the sorted day list from raw cycle/recovery responses.
+# Arguments:
+#   Cycle JSON, recovery JSON.
+# Outputs:
+#   A JSON array of {date_epoch, strain, strain_state, recovery,
+#   recovery_state}, oldest first, on stdout.
+#######################################
+whoop_build_days() {
+  local cycle="$1" recovery="$2"
+  jq -n --argjson cycle "$cycle" --argjson recovery "$recovery" '
+    ($cycle.records // []) as $cycles |
+    ($recovery.records // []) as $recoveries |
+    [$cycles[] as $c |
+      ($recoveries | map(select(.cycle_id == $c.id)) | .[0]) as $r |
+      {
+        date_epoch: ($c.start | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601),
+        strain: ($c.score.strain // null),
+        strain_state: ($c.score_state // "UNKNOWN"),
+        recovery: ($r.score.recovery_score // null),
+        recovery_state: ($r.score_state // "UNKNOWN")
+      }
+    ] | sort_by(.date_epoch)
+  '
+}
+
+#######################################
+# Stamps each day in a whoop_build_days array with a weekday/day label,
+# counting back from today.
+# Arguments:
+#   The JSON array produced by whoop_build_days.
+# Outputs:
+#   The same array with "weekday" and "day" added to each element.
+#######################################
+whoop_label_days() {
+  local days="$1" count
+  count=$(jq 'length' <<< "$days")
+
+  local idx=0 row offset weekday day
+  while IFS= read -r row; do
+    offset=$(( count - 1 - idx ))
+    weekday=$(date -d "-${offset} days" +%a)
+    day=$(date -d "-${offset} days" +%-d)
+    jq -c --arg weekday "$weekday" --arg day "$day" \
+      '. + {weekday: $weekday, day: $day}' <<< "$row"
+    idx=$(( idx + 1 ))
+  done < <(jq -c '.[]' <<< "$days") | jq -s '.'
+}
+
+main() {
+  local numdays=7 force=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --days) numdays="$2"; shift 2 ;;
+      --force) force=true; shift ;;
+      *) shift ;;
+    esac
+  done
+  [[ "$numdays" =~ ^[0-9]+$ ]] || { echo "Invalid --days value: $numdays" >&2; exit 1; }
+  # WHOOP caps the limit query param at 25 per page.
+  (( numdays > 25 )) && numdays=25
+
+  mkdir -p "$OMAWHOOP_CACHE_DIR"
+  chmod 700 "$OMAWHOOP_CACHE_DIR"
+  local cache_file="$OMAWHOOP_CACHE_DIR/history-${numdays}.json"
+
+  if [[ "$force" == false && -f "$cache_file" ]]; then
+    local fetched_at now
+    fetched_at=$(jq -r '.fetched_at // 0' "$cache_file")
+    now=$(date +%s)
+
+    if (( now - fetched_at < 900 )); then
+      cat "$cache_file"
+      return 0
+    fi
+  fi
+
+  local token
+  token=$(whoop_ensure_token) || { echo '{"error":"not_authenticated"}'; exit 1; }
+
+  local cycle recovery
+  whoop_api_get "$token" "/v2/cycle?limit=$numdays"
+  cycle="$body"; [[ "$status" == 2* ]] || cycle="null"
+  whoop_api_get "$token" "/v2/recovery?limit=$numdays"
+  recovery="$body"; [[ "$status" == 2* ]] || recovery="null"
+
+  if [[ "$cycle" == "null" && "$recovery" == "null" ]]; then
+    if [[ -f "$cache_file" ]]; then
+      jq '.stale = true' "$cache_file"
+      return 0
+    fi
+    echo '{"error":"fetch_failed"}'
+    exit 1
+  fi
+
+  local base days_json result
+  base=$(whoop_build_days "$cycle" "$recovery")
+  days_json=$(whoop_label_days "$base")
+  result=$(jq -n --argjson days "$days_json" --argjson now "$(date +%s)" \
+    '{fetched_at: $now, stale: false, days: $days}')
+
+  echo "$result" > "$cache_file"
+  chmod 600 "$cache_file"
+  echo "$result"
+}
+
+main "$@"
