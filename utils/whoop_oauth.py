@@ -18,14 +18,22 @@ def listen_for_callback(port, expected_state):
     result = {}
 
     class Handler(BaseHTTPRequestHandler):
+        # The server is single-threaded, so a client that connects and sends
+        # nothing (a browser preconnect, a port probe) would otherwise block
+        # the real redirect behind it. Drop idle connections quickly.
+        timeout = 5
+
         def log_message(self, *args):
             pass
 
         def _reply(self, status, msg):
-            self.send_response(status)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(f"<html><body style='font-family:sans-serif'>{msg}</body></html>".encode())
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(f"<html><body style='font-family:sans-serif'>{msg}</body></html>".encode())
+            except OSError:
+                pass  # client went away mid-reply; result (if any) is already recorded
 
         def do_GET(self):
             qs = parse_qs(urlparse(self.path).query)
