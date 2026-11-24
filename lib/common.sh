@@ -1,6 +1,10 @@
 # Shared paths and helpers for omawhoop-auth / omawhoop-status /
 # omawhoop-history. Sourced, not executed.
 
+# Everything this plugin writes (config, tokens, cache) is private to the user,
+# including the brief window before an explicit chmod.
+umask 077
+
 readonly OMAWHOOP_CONFIG_DIR="$HOME/.config/omawhoop"
 readonly OMAWHOOP_CONFIG_FILE="$OMAWHOOP_CONFIG_DIR/config"
 readonly OMAWHOOP_STATE_DIR="$HOME/.local/state/omawhoop"
@@ -18,6 +22,59 @@ readonly WHOOP_API_BASE="https://api.prod.whoop.com/developer"
 # without it, access_token-only responses expire in ~1hr with no way to
 # renew short of a full re-authorization.
 readonly WHOOP_SCOPES="read:recovery read:cycles read:sleep read:workout read:profile read:body_measurement offline"
+
+#######################################
+# Percent-encodes stdin for an application/x-www-form-urlencoded body.
+#######################################
+whoop_urlencode() {
+  jq -sRr @uri
+}
+
+#######################################
+# POSTs a form to a URL. The body is piped to curl on stdin, so the client
+# secret, auth code and refresh token never appear in argv (visible to other
+# processes through `ps` and /proc/<pid>/cmdline).
+# Arguments:
+#   URL, then NAME VALUE pairs.
+# Outputs:
+#   Response body, a newline, then the HTTP status code.
+#######################################
+whoop_post_form() {
+  local url="$1" body="" sep=""
+  shift
+  while (($#)); do
+    body+="${sep}$1=$(printf '%s' "$2" | whoop_urlencode)"
+    sep="&"
+    shift 2
+  done
+  printf '%s' "$body" | curl -sS -w '\n%{http_code}' -X POST --data-binary @- "$url"
+}
+
+#######################################
+# Sends a request with a bearer token. The Authorization header is read by
+# curl from stdin (-H @-) so the token stays out of argv.
+# Arguments:
+#   Bearer token, HTTP method, URL.
+# Outputs:
+#   Response body, a newline, then the HTTP status code.
+#######################################
+whoop_authed_request() {
+  local token="$1" method="$2" url="$3"
+  printf 'Authorization: Bearer %s\n' "$token" |
+    curl -sS -w '\n%{http_code}' -X "$method" -H @- "$url"
+}
+
+#######################################
+# Reduces an OAuth error response to its error fields. Never echo a raw
+# token-endpoint response: a success body carries live tokens.
+# Arguments:
+#   Response body.
+#######################################
+whoop_error_summary() {
+  local out
+  out=$(jq -r '[.error, .error_description] | map(select(type == "string")) | join(": ")' <<< "$1" 2>/dev/null) || out=""
+  echo "${out:-no error detail}"
+}
 
 #######################################
 # Loads CLIENT_ID / CLIENT_SECRET from disk into the current shell.
@@ -81,15 +138,15 @@ whoop_ensure_token() {
   [[ -n "$refresh" ]] || return 1
 
   local resp_raw http_status resp
-  resp_raw=$(curl -sS -w '\n%{http_code}' -X POST "$WHOOP_TOKEN_URL" \
-    --data-urlencode "grant_type=refresh_token" \
-    --data-urlencode "refresh_token=$refresh" \
-    --data-urlencode "client_id=$CLIENT_ID" \
-    --data-urlencode "client_secret=$CLIENT_SECRET") || return 1
+  resp_raw=$(whoop_post_form "$WHOOP_TOKEN_URL" \
+    grant_type refresh_token \
+    refresh_token "$refresh" \
+    client_id "$CLIENT_ID" \
+    client_secret "$CLIENT_SECRET") || return 1
   http_status="${resp_raw##*$'\n'}"
   resp="${resp_raw%$'\n'*}"
   [[ "$http_status" == 2* ]] || {
-    echo "Token refresh failed (HTTP $http_status): $resp" >&2
+    echo "Token refresh failed (HTTP $http_status): $(whoop_error_summary "$resp")" >&2
     return 1
   }
 
@@ -112,7 +169,7 @@ whoop_ensure_token() {
 #######################################
 whoop_api_get() {
   local token="$1" path="$2" raw
-  raw=$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $token" "$WHOOP_API_BASE$path") || raw=$'\n000'
+  raw=$(whoop_authed_request "$token" GET "$WHOOP_API_BASE$path") || raw=$'\n000'
   status="${raw##*$'\n'}"
   body="${raw%$'\n'*}"
   if [[ "$status" == "401" ]]; then

@@ -106,17 +106,17 @@ whoop_login() {
   fi
 
   local resp_raw http_status resp access refresh expires_in
-  resp_raw=$(curl -sS -w '\n%{http_code}' -X POST "$WHOOP_TOKEN_URL" \
-    --data-urlencode "grant_type=authorization_code" \
-    --data-urlencode "code=$code" \
-    --data-urlencode "redirect_uri=$OMAWHOOP_REDIRECT_URI" \
-    --data-urlencode "client_id=$CLIENT_ID" \
-    --data-urlencode "client_secret=$CLIENT_SECRET")
+  resp_raw=$(whoop_post_form "$WHOOP_TOKEN_URL" \
+    grant_type authorization_code \
+    code "$code" \
+    redirect_uri "$OMAWHOOP_REDIRECT_URI" \
+    client_id "$CLIENT_ID" \
+    client_secret "$CLIENT_SECRET")
   http_status="${resp_raw##*$'\n'}"
   resp="${resp_raw%$'\n'*}"
 
   if [[ "$http_status" != 2* ]]; then
-    echo "Token exchange failed (HTTP $http_status): $resp" >&2
+    echo "Token exchange failed (HTTP $http_status): $(whoop_error_summary "$resp")" >&2
     exit 1
   fi
 
@@ -125,11 +125,11 @@ whoop_login() {
   expires_in=$(jq -r '.expires_in // 3600' <<< "$resp")
 
   if [[ -z "$access" ]]; then
-    echo "Token exchange response missing access_token (HTTP $http_status): $resp" >&2
+    echo "Token exchange response missing access_token (HTTP $http_status): $(whoop_error_summary "$resp")" >&2
     exit 1
   fi
   if [[ -z "$refresh" ]]; then
-    echo "Got an access token but no refresh_token — the WHOOP app may not have 'offline_access' enabled. Response: $resp" >&2
+    echo "Got an access token but no refresh_token — the WHOOP app may not have 'offline_access' enabled." >&2
     exit 1
   fi
 
@@ -145,8 +145,7 @@ whoop_revoke_remote_token() {
   token=$(whoop_ensure_token || true)
   [[ -n "$token" ]] || return 0
 
-  curl -fsS -X DELETE "$WHOOP_API_BASE/v2/user/access" \
-    -H "Authorization: Bearer $token" >/dev/null 2>&1 || true
+  whoop_authed_request "$token" DELETE "$WHOOP_API_BASE/v2/user/access" >/dev/null 2>&1 || true
 }
 
 whoop_logout() {
