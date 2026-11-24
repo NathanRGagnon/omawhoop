@@ -51,7 +51,7 @@ omarchy plugin remove io.github.nathanrgagnon.omawhoop
 That removes the plugin's code but leaves your saved WHOOP credentials in place in case you reinstall. To also clear those, use the panel's **Remove all data** button, or:
 
 ```bash
-rm -rf ~/.config/omarchy/omawhoop ~/.local/state/omarchy/omawhoop ~/.cache/omarchy/omawhoop
+rm -rf ~/.config/omawhoop ~/.local/state/omawhoop ~/.cache/omawhoop
 ```
 
 ## License

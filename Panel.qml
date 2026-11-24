@@ -331,6 +331,7 @@ Panel {
           Text {
             visible: root.connectError !== ""
             text: Model.truncateMessage(root.connectError, 220)
+            textFormat: Text.PlainText
             color: "#e5534b"
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.bodySmall
